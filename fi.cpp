@@ -620,6 +620,7 @@ bool process_keypress(TermiosGuard& terminal) {
             }
             break;
         case BACKSPACE:
+        case '\b':
             del_char();
             break;
         case DEL_KEY:
