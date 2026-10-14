@@ -7,6 +7,7 @@
 #include <deque>
 #include <fcntl.h>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <termios.h>
 #include <unistd.h>
@@ -21,6 +22,8 @@
 
 void die(const char* msg);
 void write_all(const char* data, size_t size);
+void get_window_size();
+void save_shell_history_row(int row);
 
 // ─── 终端配置 RAII ───────────────────────────────────────────
 struct TermiosGuard {
@@ -78,11 +81,26 @@ enum class InputMode {
     Editing,
     Command,
     ConfirmQuit,
+    ConfirmCloseBuffer,
 };
 
 // ─── 全局状态 ────────────────────────────────────────────────
+struct EditSnapshot {
+    std::vector<std::string> rows;
+    int cx = 0;
+    int cy = 0;
+};
+
+struct UndoHistory {
+    std::vector<EditSnapshot> undo_stack;
+    std::vector<EditSnapshot> redo_stack;
+};
+
 struct Buffer {
     std::vector<std::string> rows;
+    std::shared_ptr<const std::vector<std::string>> saved_rows =
+        std::make_shared<const std::vector<std::string>>();
+    std::shared_ptr<UndoHistory> undo_history = std::make_shared<UndoHistory>();
     int cx = 0, cy = 0;
     int row_offset = 0, col_offset = 0;
     std::string filename;
@@ -133,11 +151,17 @@ static InputMode input_mode = InputMode::Editing;
 static std::string command_line;
 static std::string status_message;
 static bool show_line_numbers = true;
+static volatile sig_atomic_t resize_pending = 0;
+
+void on_terminal_resize(int) {
+    resize_pending = 1;
+}
 
 // ─── 辅助函数 ────────────────────────────────────────────────
 int shell_height() {
-    return shell.master_fd < 0 ? 0 : std::min(std::max(3, screen_rows / 3),
-        std::max(0, screen_rows - 2));
+    if (shell.master_fd < 0) return 0;
+    return std::min(std::max(3, screen_rows / 3),
+        std::max(1, screen_rows - 3));
 }
 
 int editor_height() {
@@ -146,6 +170,70 @@ int editor_height() {
 
 int sidebar_width() {
     return screen_cols >= 50 ? std::min(24, screen_cols / 3) : 0;
+}
+
+void resize_shell_grid(int new_height, int new_width) {
+    if (shell.master_fd < 0) return;
+    const int old_height = static_cast<int>(shell.rows.size());
+    const int old_scroll_bottom = shell.scroll_bottom;
+    new_height = std::max(0, new_height);
+    new_width = std::max(1, new_width);
+
+    if (new_height < old_height) {
+        const int remove_count = old_height - new_height;
+        for (int row = 0; row < remove_count; row++)
+            save_shell_history_row(row);
+        shell.rows.erase(shell.rows.begin(), shell.rows.begin() + remove_count);
+        shell.styles.erase(shell.styles.begin(),
+            shell.styles.begin() + remove_count);
+        shell.cursor_y = std::max(0, shell.cursor_y - remove_count);
+        shell.saved_cursor_y = std::max(0, shell.saved_cursor_y - remove_count);
+    } else if (new_height > old_height) {
+        shell.rows.resize(static_cast<size_t>(new_height),
+            std::string(static_cast<size_t>(new_width), ' '));
+        shell.styles.resize(static_cast<size_t>(new_height),
+            std::vector<ShellStyle>(static_cast<size_t>(new_width)));
+    }
+
+    for (std::string& row : shell.rows)
+        row.resize(static_cast<size_t>(new_width), ' ');
+    for (auto& row_styles : shell.styles)
+        row_styles.resize(static_cast<size_t>(new_width));
+    for (std::string& row : shell.history)
+        row.resize(static_cast<size_t>(new_width), ' ');
+    for (auto& row_styles : shell.history_styles)
+        row_styles.resize(static_cast<size_t>(new_width));
+
+    shell.cursor_x = std::min(shell.cursor_x, new_width - 1);
+    shell.cursor_y = shell.rows.empty() ? 0 :
+        std::min(shell.cursor_y, static_cast<int>(shell.rows.size()) - 1);
+    shell.saved_cursor_x = std::min(shell.saved_cursor_x, new_width - 1);
+    shell.saved_cursor_y = shell.rows.empty() ? 0 :
+        std::min(shell.saved_cursor_y, static_cast<int>(shell.rows.size()) - 1);
+    shell.scroll_top = std::min(shell.scroll_top,
+        std::max(0, static_cast<int>(shell.rows.size()) - 1));
+    if (old_scroll_bottom == old_height - 1)
+        shell.scroll_bottom = std::max(0, static_cast<int>(shell.rows.size()) - 1);
+    else
+        shell.scroll_bottom = std::min(shell.scroll_bottom,
+            std::max(0, static_cast<int>(shell.rows.size()) - 1));
+    shell.history_offset = std::min(shell.history_offset,
+        static_cast<int>(shell.history.size()));
+}
+
+void update_terminal_size() {
+    get_window_size();
+    if (screen_rows < 1 || screen_cols < 1) return;
+    if (shell.master_fd >= 0) {
+        resize_shell_grid(shell_height(), screen_cols);
+        winsize window{};
+        window.ws_row = static_cast<unsigned short>(
+            std::max(1, shell_height()));
+        window.ws_col = static_cast<unsigned short>(screen_cols);
+        if (ioctl(shell.master_fd, TIOCSWINSZ, &window) == -1)
+            status_message = "Cannot resize shell PTY";
+    }
+    write_all("\x1b[2J\x1b[H", 7);
 }
 
 void clear_shell_row(int row) {
@@ -722,6 +810,8 @@ bool open_file(const std::string& path) {
     if (ifs.bad()) return false;
     if (opened.rows.empty()) opened.rows.push_back("");
     opened.num_rows = static_cast<int>(opened.rows.size());
+    opened.saved_rows =
+        std::make_shared<const std::vector<std::string>>(opened.rows);
     if (buffers.empty()) {
         buffers.push_back(opened);
         active_buffer = 0;
@@ -756,6 +846,8 @@ bool save_buffer(Buffer& buffer, const std::string& path = "") {
         return false;
     }
     buffer.filename = destination;
+    buffer.saved_rows =
+        std::make_shared<const std::vector<std::string>>(buffer.rows);
     buffer.dirty = false;
     status_message = "Saved " + destination;
     return true;
@@ -780,6 +872,43 @@ bool has_modified_buffers() {
     sync_current_buffer();
     return std::any_of(buffers.begin(), buffers.end(),
         [](const Buffer& buffer) { return buffer.dirty; });
+}
+
+void create_empty_buffer() {
+    Buffer created;
+    created.rows.push_back("");
+    created.saved_rows =
+        std::make_shared<const std::vector<std::string>>(created.rows);
+    created.num_rows = 1;
+    sync_current_buffer();
+    buffers.push_back(created);
+    active_buffer = buffers.size() - 1;
+    buf = std::move(created);
+    status_message = "New buffer";
+}
+
+void close_active_buffer(bool force) {
+    sync_current_buffer();
+    if (!force && buf.dirty) {
+        input_mode = InputMode::ConfirmCloseBuffer;
+        status_message.clear();
+        return;
+    }
+    const size_t closing = active_buffer;
+    buffers.erase(buffers.begin() + static_cast<std::ptrdiff_t>(closing));
+    if (buffers.empty()) {
+        Buffer scratch;
+        scratch.rows.push_back("");
+        scratch.saved_rows =
+            std::make_shared<const std::vector<std::string>>(scratch.rows);
+        scratch.num_rows = 1;
+        buffers.push_back(std::move(scratch));
+        active_buffer = 0;
+    } else {
+        if (active_buffer >= buffers.size()) active_buffer = buffers.size() - 1;
+    }
+    buf = buffers[active_buffer];
+    status_message = "Buffer closed";
 }
 
 // ─── 输入处理 ────────────────────────────────────────────────
@@ -843,6 +972,58 @@ int read_key() {
 }
 
 // ─── 光标移动 ────────────────────────────────────────────────
+EditSnapshot capture_edit_snapshot() {
+    return EditSnapshot{buf.rows, buf.cx, buf.cy};
+}
+
+void record_edit() {
+    constexpr size_t max_undo_steps = 200;
+    UndoHistory& history = *buf.undo_history;
+    history.undo_stack.push_back(capture_edit_snapshot());
+    if (history.undo_stack.size() > max_undo_steps)
+        history.undo_stack.erase(history.undo_stack.begin());
+    history.redo_stack.clear();
+}
+
+void update_buffer_dirty() {
+    buf.num_rows = static_cast<int>(buf.rows.size());
+    buf.dirty = !buf.saved_rows || buf.rows != *buf.saved_rows;
+}
+
+bool undo_edit() {
+    UndoHistory& history = *buf.undo_history;
+    if (history.undo_stack.empty()) {
+        status_message = "Nothing to undo";
+        return false;
+    }
+    history.redo_stack.push_back(capture_edit_snapshot());
+    const EditSnapshot snapshot = std::move(history.undo_stack.back());
+    history.undo_stack.pop_back();
+    buf.rows = snapshot.rows;
+    buf.cx = snapshot.cx;
+    buf.cy = snapshot.cy;
+    update_buffer_dirty();
+    status_message = "Undo";
+    return true;
+}
+
+bool redo_edit() {
+    UndoHistory& history = *buf.undo_history;
+    if (history.redo_stack.empty()) {
+        status_message = "Nothing to redo";
+        return false;
+    }
+    history.undo_stack.push_back(capture_edit_snapshot());
+    const EditSnapshot snapshot = std::move(history.redo_stack.back());
+    history.redo_stack.pop_back();
+    buf.rows = snapshot.rows;
+    buf.cx = snapshot.cx;
+    buf.cy = snapshot.cy;
+    update_buffer_dirty();
+    status_message = "Redo";
+    return true;
+}
+
 void move_cursor(int key) {
     if (key == ARROW_LEFT) {
         if (buf.cx > 0) {
@@ -868,6 +1049,7 @@ void move_cursor(int key) {
 
 // ─── 编辑操作 ────────────────────────────────────────────────
 void insert_char(int c) {
+    record_edit();
     if (buf.cy == buf.num_rows) {
         buf.rows.push_back("");
         buf.num_rows++;
@@ -879,6 +1061,7 @@ void insert_char(int c) {
 }
 
 void insert_newline() {
+    record_edit();
     if (buf.cx == 0) {
         buf.rows.insert(buf.rows.begin() + buf.cy, "");
     } else {
@@ -896,6 +1079,7 @@ void insert_newline() {
 void del_char() {
     if (buf.cy == buf.num_rows) return;
     if (buf.cx == 0 && buf.cy == 0) return;
+    record_edit();
     if (buf.cx > 0) {
         buf.rows[buf.cy].erase(buf.cx - 1, 1);
         buf.cx--;
@@ -913,14 +1097,15 @@ void del_char() {
 void delete_char() {
     if (buf.cy >= buf.num_rows) return;
     std::string& row = buf.rows[buf.cy];
+    if (buf.cx >= static_cast<int>(row.size()) && buf.cy >= buf.num_rows - 1)
+        return;
+    record_edit();
     if (buf.cx < static_cast<int>(row.size())) {
         row.erase(buf.cx, 1);
     } else if (buf.cy < buf.num_rows - 1) {
         row += buf.rows[buf.cy + 1];
         buf.rows.erase(buf.rows.begin() + buf.cy + 1);
         buf.num_rows--;
-    } else {
-        return;
     }
     buf.dirty = true;
 }
@@ -1102,6 +1287,11 @@ void draw_status_bar(std::string& ab) {
         ab += "\x1b[K\x1b[m";
         return;
     }
+    if (input_mode == InputMode::ConfirmCloseBuffer) {
+        ab += "Save changes before closing this buffer? (y/n, Esc to cancel)";
+        ab += "\x1b[K\x1b[m";
+        return;
+    }
     if (!status_message.empty()) {
         ab.append(status_message, 0, static_cast<size_t>(screen_cols));
         ab += "\x1b[K\x1b[m";
@@ -1203,6 +1393,27 @@ bool execute_command(const std::string& line) {
         } else if (!open_file(argument)) {
             status_message = "Cannot open file: " + argument;
         }
+    } else if (name == "new") {
+        if (!argument.empty())
+            status_message = "Usage: :new";
+        else
+            create_empty_buffer();
+    } else if (name == "bd") {
+        if (!argument.empty())
+            status_message = "Usage: :bd";
+        else
+            close_active_buffer(false);
+    } else if (name == "bd!") {
+        if (!argument.empty())
+            status_message = "Usage: :bd!";
+        else
+            close_active_buffer(true);
+    } else if (name == "undo" || name == "u") {
+        if (!argument.empty()) status_message = "Usage: :undo";
+        else undo_edit();
+    } else if (name == "redo") {
+        if (!argument.empty()) status_message = "Usage: :redo";
+        else redo_edit();
     } else if (name == "buffer" || name == "b") {
         if (argument.empty()) {
             status_message = "Usage: :buffer <number> (see :buffers)";
@@ -1343,7 +1554,7 @@ bool execute_command(const std::string& line) {
             }
         }
     } else if (name == "help") {
-        status_message = ":open <file> :buffers :buffer <n> :bnext :bprev :set number :noset number :w :q :q! :wq :find <text> :shell";
+        status_message = ":new :bd[!] :undo :redo :open <file> :buffers :buffer <n> :bnext :bprev :w :q :q! :wq :set/noset number :shell";
     } else if (!name.empty()) {
         status_message = "Unknown command: " + name + " (try :help)";
     }
@@ -1408,6 +1619,18 @@ bool process_keypress() {
         }
         return true;
     }
+    if (input_mode == InputMode::ConfirmCloseBuffer) {
+        if (c == '\x1b') {
+            input_mode = InputMode::Editing;
+        } else if (c == 'y' || c == 'Y') {
+            input_mode = InputMode::Editing;
+            if (save_file()) close_active_buffer(true);
+        } else if (c == 'n' || c == 'N') {
+            input_mode = InputMode::Editing;
+            close_active_buffer(true);
+        }
+        return true;
+    }
 
     switch (c) {
         case '\x1b':
@@ -1457,6 +1680,11 @@ bool process_keypress() {
 
 int main(int argc, char* argv[]) {
     TermiosGuard guard;
+    struct sigaction resize_action{};
+    resize_action.sa_handler = on_terminal_resize;
+    sigemptyset(&resize_action.sa_mask);
+    if (sigaction(SIGWINCH, &resize_action, nullptr) == -1)
+        die("sigaction");
     get_window_size();
     if (argc >= 2) {
         for (int i = 1; i < argc; i++) {
@@ -1469,11 +1697,17 @@ int main(int argc, char* argv[]) {
     }
     if (argc < 2) {
         buf.rows.push_back("");
+        buf.saved_rows =
+            std::make_shared<const std::vector<std::string>>(buf.rows);
         buf.num_rows = 1;
         buffers.push_back(buf);
     }
 
     while (true) {
+        if (resize_pending) {
+            resize_pending = 0;
+            update_terminal_size();
+        }
         refresh_screen();
         pollfd descriptors[2] = {
             {STDIN_FILENO, POLLIN, 0},
@@ -1483,7 +1717,12 @@ int main(int argc, char* argv[]) {
         int ready;
         do {
             ready = poll(descriptors, descriptor_count, -1);
-        } while (ready == -1 && errno == EINTR);
+        } while (ready == -1 && errno == EINTR && !resize_pending);
+        if (resize_pending) {
+            resize_pending = 0;
+            update_terminal_size();
+            continue;
+        }
         if (ready == -1) die("poll");
 
         if (descriptor_count == 2 &&
