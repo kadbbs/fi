@@ -78,7 +78,6 @@ enum class InputMode {
     Editing,
     Command,
     ConfirmQuit,
-    ConfirmOpen,
 };
 
 // ─── 全局状态 ────────────────────────────────────────────────
@@ -126,12 +125,13 @@ struct ShellPane {
 };
 
 static Buffer buf;
+static std::vector<Buffer> buffers;
+static size_t active_buffer = 0;
 static ShellPane shell;
 static int screen_rows, screen_cols;
 static InputMode input_mode = InputMode::Editing;
 static std::string command_line;
 static std::string status_message;
-static std::string pending_filename;
 static bool show_line_numbers = true;
 
 // ─── 辅助函数 ────────────────────────────────────────────────
@@ -141,7 +141,11 @@ int shell_height() {
 }
 
 int editor_height() {
-    return screen_rows - (shell.master_fd < 0 ? 0 : shell_height() + 1);
+    return std::max(1, screen_rows - (shell.master_fd < 0 ? 0 : shell_height() + 1) - 1);
+}
+
+int sidebar_width() {
+    return screen_cols >= 50 ? std::min(24, screen_cols / 3) : 0;
 }
 
 void clear_shell_row(int row) {
@@ -571,11 +575,12 @@ void send_key_to_shell(int key) {
 }
 
 int line_number_width() {
-    if (!show_line_numbers || screen_cols < 2) return 0;
+    const int available_width = screen_cols - sidebar_width();
+    if (!show_line_numbers || available_width < 2) return 0;
     int digits = 1;
     for (int rows = std::max(buf.num_rows, 1); rows >= 10; rows /= 10)
         digits++;
-    return std::min(digits + 2, screen_cols - 1);
+    return std::min(digits + 2, available_width - 1);
 }
 
 void die(const char* msg) {
@@ -645,7 +650,65 @@ void get_window_size() {
 }
 
 // ─── 文件操作 ────────────────────────────────────────────────
+std::string normalized_file_path(const std::string& path) {
+    std::string absolute = path;
+    if (path.empty() || path[0] != '/') {
+        char cwd[4096];
+        if (getcwd(cwd, sizeof(cwd)) == nullptr) return path;
+        absolute = std::string(cwd) + "/" + path;
+    }
+    std::vector<std::string> components;
+    size_t start = 0;
+    while (start < absolute.size()) {
+        const size_t end = absolute.find('/', start);
+        const std::string component = absolute.substr(start,
+            end == std::string::npos ? std::string::npos : end - start);
+        if (!component.empty() && component != ".") {
+            if (component == "..") {
+                if (!components.empty()) components.pop_back();
+            } else {
+                components.push_back(component);
+            }
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    std::string normalized = "/";
+    for (size_t i = 0; i < components.size(); i++) {
+        if (i > 0) normalized += '/';
+        normalized += components[i];
+    }
+    return normalized;
+}
+
+void sync_current_buffer() {
+    if (buffers.empty()) {
+        buffers.push_back(buf);
+        active_buffer = 0;
+    } else {
+        buffers[active_buffer] = buf;
+    }
+}
+
+bool switch_buffer(size_t index) {
+    if (index >= buffers.size()) {
+        status_message = "No such open buffer";
+        return false;
+    }
+    sync_current_buffer();
+    active_buffer = index;
+    buf = buffers[active_buffer];
+    status_message = "Switched to " +
+        (buf.filename.empty() ? std::string("[No Name]") : buf.filename);
+    return true;
+}
+
 bool open_file(const std::string& path) {
+    for (size_t i = 0; i < buffers.size(); i++) {
+        if (!buffers[i].filename.empty() &&
+            normalized_file_path(buffers[i].filename) == normalized_file_path(path))
+            return switch_buffer(i);
+    }
     std::ifstream ifs(path);
     if (!ifs.is_open()) {
         if (access(path.c_str(), F_OK) == 0 || errno != ENOENT) return false;
@@ -659,13 +722,21 @@ bool open_file(const std::string& path) {
     if (ifs.bad()) return false;
     if (opened.rows.empty()) opened.rows.push_back("");
     opened.num_rows = static_cast<int>(opened.rows.size());
+    if (buffers.empty()) {
+        buffers.push_back(opened);
+        active_buffer = 0;
+    } else {
+        sync_current_buffer();
+        buffers.push_back(opened);
+        active_buffer = buffers.size() - 1;
+    }
     buf = std::move(opened);
-    status_message.clear();
+    status_message = "Opened " + path;
     return true;
 }
 
-bool save_file(const std::string& path = "") {
-    const std::string destination = path.empty() ? buf.filename : path;
+bool save_buffer(Buffer& buffer, const std::string& path = "") {
+    const std::string destination = path.empty() ? buffer.filename : path;
     if (destination.empty()) {
         status_message = "No file name; use :w <file>";
         return false;
@@ -675,19 +746,40 @@ bool save_file(const std::string& path = "") {
         status_message = "Cannot write file: " + destination;
         return false;
     }
-    for (int i = 0; i < buf.num_rows; i++) {
-        ofs << buf.rows[i];
-        if (i != buf.num_rows - 1) ofs << '\n';
+    for (int i = 0; i < buffer.num_rows; i++) {
+        ofs << buffer.rows[i];
+        if (i != buffer.num_rows - 1) ofs << '\n';
     }
     ofs << '\n';
     if (!ofs) {
         status_message = "Write failed: " + destination;
         return false;
     }
-    buf.filename = destination;
-    buf.dirty = false;
+    buffer.filename = destination;
+    buffer.dirty = false;
     status_message = "Saved " + destination;
     return true;
+}
+
+bool save_file(const std::string& path = "") {
+    const bool saved = save_buffer(buf, path);
+    if (saved) sync_current_buffer();
+    return saved;
+}
+
+bool save_all_buffers() {
+    sync_current_buffer();
+    for (Buffer& buffer : buffers) {
+        if (buffer.dirty && !save_buffer(buffer)) return false;
+    }
+    buf = buffers[active_buffer];
+    return true;
+}
+
+bool has_modified_buffers() {
+    sync_current_buffer();
+    return std::any_of(buffers.begin(), buffers.end(),
+        [](const Buffer& buffer) { return buffer.dirty; });
 }
 
 // ─── 输入处理 ────────────────────────────────────────────────
@@ -835,7 +927,8 @@ void delete_char() {
 
 // ─── 渲染 ────────────────────────────────────────────────────
 void scroll() {
-    const int text_width = std::max(1, screen_cols - line_number_width());
+    const int text_width = std::max(1,
+        screen_cols - sidebar_width() - line_number_width());
     const int visible_rows = std::max(1, editor_height());
     if (buf.cy < buf.row_offset) buf.row_offset = buf.cy;
     if (buf.cy >= buf.row_offset + visible_rows)
@@ -846,10 +939,37 @@ void scroll() {
 }
 
 void draw_rows(std::string& ab) {
+    const int side_width = sidebar_width();
+    const int side_text_width = std::max(0, side_width - 1);
     const int gutter_width = line_number_width();
-    const int text_width = std::max(1, screen_cols - gutter_width);
+    const int text_width = std::max(1, screen_cols - side_width - gutter_width);
     const int visible_rows = editor_height();
+    const int sidebar_offset = std::max(0,
+        static_cast<int>(active_buffer) - visible_rows + 1);
     for (int y = 0; y < visible_rows; y++) {
+        if (side_width > 0) {
+            const int item = sidebar_offset + y;
+            if (item < static_cast<int>(buffers.size())) {
+                const Buffer& entry = buffers[static_cast<size_t>(item)];
+                const size_t slash = entry.filename.find_last_of('/');
+                std::string label = entry.filename.empty() ? "[No Name]"
+                    : entry.filename.substr(slash == std::string::npos
+                        ? 0 : slash + 1);
+                if (entry.dirty) label += '*';
+                const bool selected = static_cast<size_t>(item) == active_buffer;
+                std::string cell = selected ? "> " : "  ";
+                cell += label;
+                if (cell.size() > static_cast<size_t>(side_text_width))
+                    cell.resize(static_cast<size_t>(side_text_width));
+                if (selected) ab += "\x1b[7m";
+                ab += cell;
+                ab.append(static_cast<size_t>(side_text_width) - cell.size(), ' ');
+                if (selected) ab += "\x1b[m";
+            } else {
+                ab.append(static_cast<size_t>(side_text_width), ' ');
+            }
+            ab += "\x1b[36m|\x1b[m";
+        }
         int filerow = y + buf.row_offset;
         if (filerow >= buf.num_rows) {
             if (buf.num_rows == 0 && y == visible_rows / 3) {
@@ -886,10 +1006,14 @@ void draw_rows(std::string& ab) {
             ab.append(row.data() + start, len);
         }
         ab += "\x1b[K";  // 清除行尾
-        if (y + 1 < screen_rows) ab += "\r\n";
+        if (y + 1 < visible_rows) ab += "\r\n";
     }
 
     if (shell.master_fd >= 0) {
+        char shell_header_pos[32];
+        snprintf(shell_header_pos, sizeof(shell_header_pos), "\x1b[%d;1H",
+            editor_height() + 1);
+        ab += shell_header_pos;
         ab += shell.focused ? "\x1b[1;36m" : "\x1b[36m";
         const std::string header = shell.focused
             ? "--- SHELL | F6: editor | PgUp/PgDn: scrollback"
@@ -930,6 +1054,31 @@ void draw_rows(std::string& ab) {
             if (visible + 1 < height) ab += "\r\n";
         }
     }
+
+    char buffer_bar_pos[32];
+    snprintf(buffer_bar_pos, sizeof(buffer_bar_pos), "\x1b[%d;1H", screen_rows);
+    ab += buffer_bar_pos;
+    ab += "\x1b[46;30m";
+    std::string buffer_bar = " FILES ";
+    for (size_t order = 0; order < buffers.size(); order++) {
+        const size_t i = order == 0 ? active_buffer
+            : (order <= active_buffer ? order - 1 : order);
+        const Buffer& entry = buffers[i];
+        const size_t slash = entry.filename.find_last_of('/');
+        std::string label = entry.filename.empty() ? "[No Name]"
+            : entry.filename.substr(slash == std::string::npos ? 0 : slash + 1);
+        if (entry.dirty) label += '*';
+        const std::string item = order == 0
+            ? " [" + std::to_string(i + 1) + ":" + label + "]"
+            : " " + std::to_string(i + 1) + ":" + label;
+        buffer_bar += item;
+    }
+    ab.append(buffer_bar, 0, static_cast<size_t>(screen_cols));
+    const size_t shown = std::min(buffer_bar.size(),
+        static_cast<size_t>(screen_cols));
+    if (shown < static_cast<size_t>(screen_cols))
+        ab.append(static_cast<size_t>(screen_cols) - shown, ' ');
+    ab += "\x1b[0m";
 }
 
 void draw_status_bar(std::string& ab) {
@@ -949,14 +1098,7 @@ void draw_status_bar(std::string& ab) {
         return;
     }
     if (input_mode == InputMode::ConfirmQuit) {
-        ab += "Save changes before quitting? (y/n, Esc to cancel)";
-        ab += "\x1b[K\x1b[m";
-        return;
-    }
-    if (input_mode == InputMode::ConfirmOpen) {
-        const std::string prompt = "Save changes before opening " +
-            pending_filename + "? (y/n, Esc to cancel)";
-        ab.append(prompt, 0, static_cast<size_t>(screen_cols));
+        ab += "Save all modified files before quitting? (y/n, Esc to cancel)";
         ab += "\x1b[K\x1b[m";
         return;
     }
@@ -985,6 +1127,7 @@ void draw_status_bar(std::string& ab) {
 }
 
 void refresh_screen() {
+    sync_current_buffer();
     scroll();
     std::string ab;
     ab += "\x1b[?25l";  // 隐藏光标
@@ -1010,7 +1153,8 @@ void refresh_screen() {
     } else {
         snprintf(buf_pos, sizeof(buf_pos), "\x1b[%d;%dH",
             (buf.cy - buf.row_offset) + 1,
-            line_number_width() + (buf.cx - buf.col_offset) + 1);
+            sidebar_width() + line_number_width() +
+                (buf.cx - buf.col_offset) + 1);
     }
     ab += buf_pos;
     ab += "\x1b[?25h";  // 显示光标
@@ -1036,7 +1180,7 @@ bool execute_command(const std::string& line) {
     } else if (name == "w" || name == "write") {
         save_file(argument);
     } else if (name == "q" || name == "quit") {
-        if (buf.dirty) {
+        if (has_modified_buffers()) {
             input_mode = InputMode::ConfirmQuit;
         } else {
             write_all("\x1b[2J\x1b[H", 7);
@@ -1047,18 +1191,53 @@ bool execute_command(const std::string& line) {
         return false;
     } else if (name == "wq" || name == "x") {
         if (save_file(argument)) {
-            write_all("\x1b[2J\x1b[H", 7);
-            return false;
+            if (has_modified_buffers()) input_mode = InputMode::ConfirmQuit;
+            else {
+                write_all("\x1b[2J\x1b[H", 7);
+                return false;
+            }
         }
     } else if (name == "open" || name == "edit" || name == "e") {
         if (argument.empty()) {
             status_message = "Usage: :open <file>";
-        } else if (buf.dirty) {
-            pending_filename = argument;
-            input_mode = InputMode::ConfirmOpen;
         } else if (!open_file(argument)) {
             status_message = "Cannot open file: " + argument;
         }
+    } else if (name == "buffer" || name == "b") {
+        if (argument.empty()) {
+            status_message = "Usage: :buffer <number> (see :buffers)";
+        } else {
+            char* end = nullptr;
+            const long number = std::strtol(argument.c_str(), &end, 10);
+            if (end == argument.c_str() || *end != '\0' || number < 1 ||
+                static_cast<size_t>(number) > buffers.size()) {
+                status_message = "No such open buffer: " + argument;
+            } else {
+                switch_buffer(static_cast<size_t>(number - 1));
+            }
+        }
+    } else if (name == "bnext" || name == "bn") {
+        if (buffers.size() > 1)
+            switch_buffer((active_buffer + 1) % buffers.size());
+        else
+            status_message = "Only one buffer is open";
+    } else if (name == "bprev" || name == "bp") {
+        if (buffers.size() > 1)
+            switch_buffer((active_buffer + buffers.size() - 1) % buffers.size());
+        else
+            status_message = "Only one buffer is open";
+    } else if (name == "buffers") {
+        std::string listing = "Open files:";
+        for (size_t i = 0; i < buffers.size(); i++) {
+            const size_t slash = buffers[i].filename.find_last_of('/');
+            const std::string label = buffers[i].filename.empty() ? "[No Name]"
+                : buffers[i].filename.substr(slash == std::string::npos
+                    ? 0 : slash + 1);
+            listing += " " + std::to_string(i + 1) +
+                (i == active_buffer ? ">" : ":") + label +
+                (buffers[i].dirty ? "*" : "");
+        }
+        status_message = listing;
     } else if (name == "find" || name == "search") {
         if (argument.empty()) {
             status_message = "Usage: :find <text>";
@@ -1164,7 +1343,7 @@ bool execute_command(const std::string& line) {
             }
         }
     } else if (name == "help") {
-        status_message = ":set number :noset number :w [file] :q :q! :wq :open <file> :find <text> :shell (F6) :shell close";
+        status_message = ":open <file> :buffers :buffer <n> :bnext :bprev :set number :noset number :w :q :q! :wq :find <text> :shell";
     } else if (!name.empty()) {
         status_message = "Unknown command: " + name + " (try :help)";
     }
@@ -1213,36 +1392,19 @@ bool process_keypress() {
         return true;
     }
 
-    if (input_mode == InputMode::ConfirmQuit ||
-        input_mode == InputMode::ConfirmOpen) {
-        const bool quitting = input_mode == InputMode::ConfirmQuit;
+    if (input_mode == InputMode::ConfirmQuit) {
         if (c == '\x1b') {
             input_mode = InputMode::Editing;
-            pending_filename.clear();
         } else if (c == 'y' || c == 'Y') {
             input_mode = InputMode::Editing;
-            if (save_file()) {
-                if (quitting) {
-                    write_all("\x1b[2J\x1b[H", 7);
-                    return false;
-                }
-                const std::string filename = pending_filename;
-                pending_filename.clear();
-                if (!open_file(filename))
-                    status_message = "Cannot open file: " + filename;
-            } else {
-                pending_filename.clear();
-            }
-        } else if (c == 'n' || c == 'N') {
-            input_mode = InputMode::Editing;
-            if (quitting) {
+            if (save_all_buffers()) {
                 write_all("\x1b[2J\x1b[H", 7);
                 return false;
             }
-            const std::string filename = pending_filename;
-            pending_filename.clear();
-            if (!open_file(filename))
-                status_message = "Cannot open file: " + filename;
+        } else if (c == 'n' || c == 'N') {
+            input_mode = InputMode::Editing;
+            write_all("\x1b[2J\x1b[H", 7);
+            return false;
         }
         return true;
     }
@@ -1270,7 +1432,7 @@ bool process_keypress() {
         case PAGE_DOWN:
             {
                 if (c == PAGE_UP) buf.cy = buf.row_offset;
-                else if (c == PAGE_DOWN) buf.cy = buf.row_offset + screen_rows - 1;
+                else if (c == PAGE_DOWN) buf.cy = buf.row_offset + editor_height() - 1;
                 if (buf.cy > buf.num_rows - 1) buf.cy = buf.num_rows - 1;
                 int len = buf.rows[buf.cy].size();
                 if (buf.cx > len) buf.cx = len;
@@ -1296,13 +1458,19 @@ bool process_keypress() {
 int main(int argc, char* argv[]) {
     TermiosGuard guard;
     get_window_size();
-    if (argc >= 2 && !open_file(argv[1])) {
-        fprintf(stderr, "Cannot open file: %s\n", argv[1]);
-        return 1;
+    if (argc >= 2) {
+        for (int i = 1; i < argc; i++) {
+            if (!open_file(argv[i])) {
+                fprintf(stderr, "Cannot open file: %s\n", argv[i]);
+                return 1;
+            }
+        }
+        switch_buffer(0);
     }
     if (argc < 2) {
         buf.rows.push_back("");
         buf.num_rows = 1;
+        buffers.push_back(buf);
     }
 
     while (true) {
