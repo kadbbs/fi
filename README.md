@@ -62,21 +62,28 @@ cmake --build build --parallel
 | `:find <文本>` | 从当前位置向后查找文本 |
 | `:set number` | 开启行号 |
 | `:noset number` | 关闭行号 |
-| `:shell` | 打开内嵌 Shell 面板并切换焦点到 Shell |
-| `:shell close` | 关闭内嵌 Shell |
+| `:shell`、`:shell show` | 显示现有 Shell 面板并恢复会话；若没有会话则启动新的 Shell |
+| `:shell focus` | 把焦点切到 Shell 面板，继续接受键盘输入 |
+| `:shell hide` | 暂时隐藏面板，Shell 会话继续在后台运行；之后用 `:shell` 返回 |
+| `:shell close` | 终止 Shell 会话并关闭面板 |
+| `:editor` | 把焦点切回编辑区 |
 | `:help` | 在状态栏显示常用命令 |
 
 ### 内嵌 Shell
 
-- 在编辑器与 Shell 之间按 `F6` 切换焦点。
+- 使用 `:shell`、`:shell show`、`:shell focus` 或点击 Shell 面板切换焦点；`:shell hide` 可暂时隐藏 Shell 面板，后台会话继续保留。
 - Shell 获得焦点时，键盘输入和方向键会发送给 Shell。
+- Shell 面板可用 `:shell hide` 暂时隐藏；后台 Shell 进程和工作目录会保留，使用 `:shell` 或 `:shell show` 恢复。若 Shell 正在接收输入，先点击编辑器区域或执行 `:editor`，再执行命令。
+- 在 Shell 中执行 `exit` 会真正结束当前 Shell 进程；若只是暂时离开，先切回编辑器，再执行 `:shell hide`。
 - Shell 焦点下使用 `Page Up` / `Page Down` 查看历史输出；最多保留 2000 行。
 - Shell 支持常见 ANSI SGR 颜色、清屏、光标定位和行/字符编辑控制。它不是完整的终端模拟器，依赖备用屏幕或其他高级终端特性的交互式 TUI 程序可能无法正常显示。
 
 ### 文件标签焦点
 
-- 按 `F5` 或执行 `:tabs` 聚焦文件标签；用上/下方向键切换文件，再按 Enter、Esc 或 F5 返回编辑区。
+- 执行 `:tabs` 聚焦文件标签；用上/下方向键切换文件，再按 Enter 或 Esc 返回编辑区。
 - 支持鼠标报告的终端可点击底部文件标签或左侧文件列表来切换文件。点击后进入标签焦点，可继续用方向键浏览。
+
+项目内不依赖任何 Fn 键，以避免与终端或系统快捷键冲突。
 
 ## 注意事项
 

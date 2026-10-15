@@ -74,8 +74,6 @@ enum Key {
     END_KEY,
     PAGE_UP,
     PAGE_DOWN,
-    F5_KEY,
-    F6_KEY,
     MOUSE_CLICK,
 };
 
@@ -127,6 +125,7 @@ struct ShellStyle {
 struct ShellPane {
     int master_fd = -1;
     pid_t pid = -1;
+    bool visible = false;
     bool focused = false;
     int cursor_x = 0;
     int cursor_y = 0;
@@ -164,13 +163,13 @@ void on_terminal_resize(int) {
 
 // ─── 辅助函数 ────────────────────────────────────────────────
 int shell_height() {
-    if (shell.master_fd < 0) return 0;
+    if (shell.master_fd < 0 || !shell.visible) return 0;
     return std::min(std::max(3, screen_rows / 3),
         std::max(1, screen_rows - 3));
 }
 
 int editor_height() {
-    return std::max(1, screen_rows - (shell.master_fd < 0 ? 0 : shell_height() + 1) - 1);
+    return std::max(1, screen_rows - (shell.visible ? shell_height() + 1 : 0) - 1);
 }
 
 int sidebar_width() {
@@ -229,7 +228,7 @@ void resize_shell_grid(int new_height, int new_width) {
 void update_terminal_size() {
     get_window_size();
     if (screen_rows < 1 || screen_cols < 1) return;
-    if (shell.master_fd >= 0) {
+    if (shell.master_fd >= 0 && shell.visible) {
         resize_shell_grid(shell_height(), screen_cols);
         winsize window{};
         window.ws_row = static_cast<unsigned short>(
@@ -239,6 +238,18 @@ void update_terminal_size() {
             status_message = "Cannot resize shell PTY";
     }
     write_all("\x1b[2J\x1b[H", 7);
+}
+
+void show_shell() {
+    if (shell.master_fd < 0) return;
+    shell.visible = true;
+    resize_shell_grid(shell_height(), screen_cols);
+    winsize window{};
+    window.ws_row = static_cast<unsigned short>(std::max(1, shell_height()));
+    window.ws_col = static_cast<unsigned short>(screen_cols);
+    if (ioctl(shell.master_fd, TIOCSWINSZ, &window) == -1)
+        status_message = "Cannot resize shell PTY";
+    shell.focused = true;
 }
 
 void clear_shell_row(int row) {
@@ -970,8 +981,6 @@ int read_key() {
                             case 8: return END_KEY;
                             case 5: return PAGE_UP;
                             case 6: return PAGE_DOWN;
-                            case 15: return F5_KEY;
-                            case 17: return F6_KEY;
                         }
                         return '\x1b';
                     }
@@ -1242,15 +1251,15 @@ void draw_rows(std::string& ab) {
         if (y + 1 < visible_rows) ab += "\r\n";
     }
 
-    if (shell.master_fd >= 0) {
+    if (shell.visible) {
         char shell_header_pos[32];
         snprintf(shell_header_pos, sizeof(shell_header_pos), "\x1b[%d;1H",
             editor_height() + 1);
         ab += shell_header_pos;
         ab += shell.focused ? "\x1b[1;36m" : "\x1b[36m";
         const std::string header = shell.focused
-            ? "--- SHELL | F6: editor | PgUp/PgDn: scrollback"
-            : "--- SHELL | F6: focus";
+            ? "--- SHELL | click to leave focus | PgUp/PgDn: scrollback"
+            : "--- SHELL | click to focus";
         ab.append(header, 0, static_cast<size_t>(screen_cols));
         ab += "\x1b[0m\x1b[K\r\n";
         const size_t history_size = shell.history.size();
@@ -1314,12 +1323,12 @@ void draw_rows(std::string& ab) {
 void draw_status_bar(std::string& ab) {
     ab += "\x1b[7m";
     if (input_mode == InputMode::TabFocus) {
-        ab += "FILES | Up/Down: switch file | Enter/Esc/F5: return to editor";
+        ab += "FILES | Up/Down: switch file | Enter/Esc: return to editor";
         ab += "\x1b[K\x1b[m";
         return;
     }
     if (shell.focused && input_mode == InputMode::Editing) {
-        ab += "SHELL | F6: editor | PgUp/PgDn: scrollback | Up/Down: command history";
+        ab += "SHELL | click editor to leave focus | PgUp/PgDn: scrollback | Up/Down: command history";
         if (shell.history_offset > 0) ab += " | older output";
         ab += "\x1b[K\x1b[m";
         return;
@@ -1386,7 +1395,7 @@ void refresh_screen() {
             static_cast<size_t>(screen_cols));
         snprintf(buf_pos, sizeof(buf_pos), "\x1b[%d;%dH",
             screen_rows + 1, static_cast<int>(visible_col));
-    } else if (shell.master_fd >= 0 && shell.focused) {
+    } else if (shell.visible && shell.focused) {
         snprintf(buf_pos, sizeof(buf_pos), "\x1b[%d;%dH",
             editor_height() + 2 + shell.cursor_y,
             std::min(shell.cursor_x + 1, screen_cols));
@@ -1506,6 +1515,14 @@ bool execute_command(const std::string& line) {
             input_mode = InputMode::TabFocus;
             status_message.clear();
         }
+    } else if (name == "editor") {
+        if (!argument.empty())
+            status_message = "Usage: :editor";
+        else {
+            input_mode = InputMode::Editing;
+            shell.focused = false;
+            status_message.clear();
+        }
     } else if (name == "find" || name == "search") {
         if (argument.empty()) {
             status_message = "Usage: :find <text>";
@@ -1526,10 +1543,29 @@ bool execute_command(const std::string& line) {
             }
             if (!found) status_message = "Not found: " + argument;
         }
+    } else if (name == "shell" && argument == "focus") {
+        if (shell.master_fd < 0) {
+            status_message = "Shell session is not open";
+        } else {
+            shell.visible = true;
+            shell.focused = true;
+            status_message.clear();
+        }
+    } else if (name == "shell" && argument == "hide") {
+        if (shell.master_fd < 0) {
+            status_message = "Shell session is not open";
+        } else if (!shell.visible) {
+            status_message = "Shell panel is already hidden";
+        } else {
+            shell.visible = false;
+            shell.focused = false;
+            status_message = "Shell hidden; session continues. Use :shell to return";
+        }
     } else if (name == "shell" && argument == "close") {
         if (shell.master_fd >= 0) {
             close(shell.master_fd);
             shell.master_fd = -1;
+            shell.visible = false;
             if (shell.pid > 0) {
                 kill(-shell.pid, SIGHUP);
                 int child_status;
@@ -1542,13 +1578,19 @@ bool execute_command(const std::string& line) {
             shell.history_styles.clear();
             shell.history_offset = 0;
             shell.focused = false;
-            status_message = "Shell panel closed";
+            status_message = "Shell session closed";
         } else {
             status_message = "Shell panel is not open";
         }
-    } else if (name == "shell") {
+    } else if (name == "shell" &&
+               (argument.empty() || argument == "show" || argument == "focus")) {
         if (shell.master_fd >= 0) {
-            shell.focused = true;
+            if (argument == "focus") {
+                shell.visible = true;
+                shell.focused = true;
+            } else {
+                show_shell();
+            }
             status_message.clear();
         } else {
             int master = posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -1582,13 +1624,14 @@ bool execute_command(const std::string& line) {
                             static_cast<char*>(nullptr));
                         _exit(127);
                     } else {
-                        winsize window{};
-                        window.ws_row = static_cast<unsigned short>(
-                            std::max(1, std::min(shell_height(), screen_rows)));
-                        window.ws_col = static_cast<unsigned short>(screen_cols);
-                        ioctl(master, TIOCSWINSZ, &window);
                         shell.master_fd = master;
                         shell.pid = child;
+                        shell.visible = true;
+                        winsize window{};
+                        window.ws_row = static_cast<unsigned short>(
+                            std::max(1, shell_height()));
+                        window.ws_col = static_cast<unsigned short>(screen_cols);
+                        ioctl(master, TIOCSWINSZ, &window);
                         shell.focused = true;
                         shell.cursor_x = 0;
                         shell.cursor_y = 0;
@@ -1610,8 +1653,10 @@ bool execute_command(const std::string& line) {
                 }
             }
         }
+    } else if (name == "shell") {
+        status_message = "Usage: :shell [show|hide|close]";
     } else if (name == "help") {
-        status_message = ":tabs (F5) :new :bd[!] :undo :redo :open <file> :buffers :buffer <n> :bnext :bprev :w :q :wq :shell";
+        status_message = ":tabs :new :bd[!] :undo :redo :open <file> :buffers :buffer <n> :bnext :bprev :w :q :wq :shell [show|hide|close|focus]";
     } else if (!name.empty()) {
         status_message = "Unknown command: " + name + " (try :help)";
     }
@@ -1643,7 +1688,7 @@ bool process_keypress() {
                 input_mode = InputMode::TabFocus;
                 shell.focused = false;
             }
-        } else if (shell.master_fd >= 0 &&
+        } else if (shell.visible &&
                    clicked_row > editor_height() &&
                    clicked_row <= screen_rows - 1) {
             input_mode = InputMode::Editing;
@@ -1654,16 +1699,9 @@ bool process_keypress() {
         }
         return true;
     }
-    if (shell.master_fd >= 0 && shell.focused &&
+    if (shell.visible && shell.focused &&
         input_mode == InputMode::Editing) {
-        if (c == F6_KEY) {
-            shell.focused = false;
-            status_message.clear();
-        } else if (c == F5_KEY) {
-            shell.focused = false;
-            input_mode = InputMode::TabFocus;
-            status_message.clear();
-        } else if (c == PAGE_UP) {
+        if (c == PAGE_UP) {
             shell.history_offset = std::min(
                 shell.history_offset + std::max(1, shell_height() / 2),
                 static_cast<int>(shell.history.size()));
@@ -1675,13 +1713,6 @@ bool process_keypress() {
         }
         return true;
     }
-    if (shell.master_fd >= 0 && c == F6_KEY &&
-        input_mode == InputMode::Editing) {
-        shell.focused = true;
-        status_message.clear();
-        return true;
-    }
-
     if (input_mode == InputMode::Command) {
         if (c == '\x1b') {
             input_mode = InputMode::Editing;
@@ -1698,7 +1729,7 @@ bool process_keypress() {
         return true;
     }
     if (input_mode == InputMode::TabFocus) {
-        if (c == '\x1b' || c == '\r' || c == '\n' || c == F5_KEY) {
+        if (c == '\x1b' || c == '\r' || c == '\n') {
             input_mode = InputMode::Editing;
         } else if (c == ARROW_UP && !buffers.empty()) {
             switch_buffer(active_buffer == 0 ? buffers.size() - 1
@@ -1743,10 +1774,6 @@ bool process_keypress() {
             command_line.clear();
             status_message.clear();
             input_mode = InputMode::Command;
-            break;
-        case F5_KEY:
-            input_mode = InputMode::TabFocus;
-            status_message.clear();
             break;
         case ARROW_UP:
         case ARROW_DOWN:
@@ -1858,6 +1885,7 @@ int main(int argc, char* argv[]) {
             if (finished) {
                 close(shell.master_fd);
                 shell.master_fd = -1;
+                shell.visible = false;
                 shell.focused = false;
                 shell.rows.clear();
                 shell.styles.clear();
