@@ -74,12 +74,15 @@ enum Key {
     END_KEY,
     PAGE_UP,
     PAGE_DOWN,
+    F5_KEY,
     F6_KEY,
+    MOUSE_CLICK,
 };
 
 enum class InputMode {
     Editing,
     Command,
+    TabFocus,
     ConfirmQuit,
     ConfirmCloseBuffer,
 };
@@ -152,6 +155,8 @@ static std::string command_line;
 static std::string status_message;
 static bool show_line_numbers = true;
 static volatile sig_atomic_t resize_pending = 0;
+static int mouse_column = 0;
+static int mouse_row = 0;
 
 void on_terminal_resize(int) {
     resize_pending = 1;
@@ -925,7 +930,31 @@ int read_key() {
         if (!read_byte(&seq[0], 30)) return '\x1b';
         if (!read_byte(&seq[1], 30)) return '\x1b';
         if (seq[0] == '[') {
-            if (seq[1] >= '0' && seq[1] <= '9') {
+            if (seq[1] == '<') {
+                char mouse_sequence[48];
+                size_t length = 0;
+                while (length < sizeof(mouse_sequence) - 1) {
+                    unsigned char byte;
+                    if (!read_byte(&byte, 30)) return '\x1b';
+                    if (byte == 'M' || byte == 'm') {
+                        mouse_sequence[length] = '\0';
+                        int button = 0;
+                        int column = 0;
+                        int row = 0;
+                        if (sscanf(mouse_sequence, "%d;%d;%d",
+                                &button, &column, &row) == 3 &&
+                            byte == 'M' && button < 64 &&
+                            (button & 3) == 0) {
+                            mouse_column = column;
+                            mouse_row = row;
+                            return MOUSE_CLICK;
+                        }
+                        return '\x1b';
+                    }
+                    mouse_sequence[length++] = static_cast<char>(byte);
+                }
+                return '\x1b';
+            } else if (seq[1] >= '0' && seq[1] <= '9') {
                 unsigned int length = 1;
                 seq[0] = seq[1];
                 while (length < 3) {
@@ -941,6 +970,7 @@ int read_key() {
                             case 8: return END_KEY;
                             case 5: return PAGE_UP;
                             case 6: return PAGE_DOWN;
+                            case 15: return F5_KEY;
                             case 17: return F6_KEY;
                         }
                         return '\x1b';
@@ -1123,6 +1153,29 @@ void scroll() {
         buf.col_offset = buf.cx - text_width + 1;
 }
 
+std::string buffer_label(size_t index) {
+    const Buffer& buffer = buffers[index];
+    const size_t slash = buffer.filename.find_last_of('/');
+    std::string label = buffer.filename.empty() ? "[No Name]"
+        : buffer.filename.substr(slash == std::string::npos ? 0 : slash + 1);
+    if (buffer.dirty) label += '*';
+    return label;
+}
+
+int buffer_at_tab_column(int column) {
+    int current = 7;
+    for (size_t i = 0; i < buffers.size(); i++) {
+        const std::string number = std::to_string(i + 1);
+        const int width = static_cast<int>(number.size() +
+            buffer_label(i).size() + (i == active_buffer ? 4 : 2));
+        if (column >= current && column < current + width)
+            return static_cast<int>(i);
+        current += width;
+        if (current >= screen_cols) return -1;
+    }
+    return -1;
+}
+
 void draw_rows(std::string& ab) {
     const int side_width = sidebar_width();
     const int side_text_width = std::max(0, side_width - 1);
@@ -1135,12 +1188,7 @@ void draw_rows(std::string& ab) {
         if (side_width > 0) {
             const int item = sidebar_offset + y;
             if (item < static_cast<int>(buffers.size())) {
-                const Buffer& entry = buffers[static_cast<size_t>(item)];
-                const size_t slash = entry.filename.find_last_of('/');
-                std::string label = entry.filename.empty() ? "[No Name]"
-                    : entry.filename.substr(slash == std::string::npos
-                        ? 0 : slash + 1);
-                if (entry.dirty) label += '*';
+                const std::string label = buffer_label(static_cast<size_t>(item));
                 const bool selected = static_cast<size_t>(item) == active_buffer;
                 std::string cell = selected ? "> " : "  ";
                 cell += label;
@@ -1244,30 +1292,32 @@ void draw_rows(std::string& ab) {
     snprintf(buffer_bar_pos, sizeof(buffer_bar_pos), "\x1b[%d;1H", screen_rows);
     ab += buffer_bar_pos;
     ab += "\x1b[46;30m";
-    std::string buffer_bar = " FILES ";
-    for (size_t order = 0; order < buffers.size(); order++) {
-        const size_t i = order == 0 ? active_buffer
-            : (order <= active_buffer ? order - 1 : order);
-        const Buffer& entry = buffers[i];
-        const size_t slash = entry.filename.find_last_of('/');
-        std::string label = entry.filename.empty() ? "[No Name]"
-            : entry.filename.substr(slash == std::string::npos ? 0 : slash + 1);
-        if (entry.dirty) label += '*';
-        const std::string item = order == 0
-            ? " [" + std::to_string(i + 1) + ":" + label + "]"
-            : " " + std::to_string(i + 1) + ":" + label;
-        buffer_bar += item;
+    int column = 0;
+    auto append_tab_cell = [&](char cell, bool active) {
+        if (column >= screen_cols) return;
+        if (active) ab += "\x1b[1;7m";
+        ab += cell;
+        if (active) ab += "\x1b[27;22m";
+        column++;
+    };
+    for (size_t i = 0; i < buffers.size() && column < screen_cols; i++) {
+        const bool active = i == active_buffer;
+        const std::string item = active
+            ? " [" + std::to_string(i + 1) + ":" + buffer_label(i) + "]"
+            : " " + std::to_string(i + 1) + ":" + buffer_label(i);
+        for (char cell : item) append_tab_cell(cell, active);
     }
-    ab.append(buffer_bar, 0, static_cast<size_t>(screen_cols));
-    const size_t shown = std::min(buffer_bar.size(),
-        static_cast<size_t>(screen_cols));
-    if (shown < static_cast<size_t>(screen_cols))
-        ab.append(static_cast<size_t>(screen_cols) - shown, ' ');
+    while (column < screen_cols) append_tab_cell(' ', false);
     ab += "\x1b[0m";
 }
 
 void draw_status_bar(std::string& ab) {
     ab += "\x1b[7m";
+    if (input_mode == InputMode::TabFocus) {
+        ab += "FILES | Up/Down: switch file | Enter/Esc/F5: return to editor";
+        ab += "\x1b[K\x1b[m";
+        return;
+    }
     if (shell.focused && input_mode == InputMode::Editing) {
         ab += "SHELL | F6: editor | PgUp/PgDn: scrollback | Up/Down: command history";
         if (shell.history_offset > 0) ab += " | older output";
@@ -1449,6 +1499,13 @@ bool execute_command(const std::string& line) {
                 (buffers[i].dirty ? "*" : "");
         }
         status_message = listing;
+    } else if (name == "tabs") {
+        if (!argument.empty())
+            status_message = "Usage: :tabs";
+        else {
+            input_mode = InputMode::TabFocus;
+            status_message.clear();
+        }
     } else if (name == "find" || name == "search") {
         if (argument.empty()) {
             status_message = "Usage: :find <text>";
@@ -1554,7 +1611,7 @@ bool execute_command(const std::string& line) {
             }
         }
     } else if (name == "help") {
-        status_message = ":new :bd[!] :undo :redo :open <file> :buffers :buffer <n> :bnext :bprev :w :q :q! :wq :set/noset number :shell";
+        status_message = ":tabs (F5) :new :bd[!] :undo :redo :open <file> :buffers :buffer <n> :bnext :bprev :w :q :wq :shell";
     } else if (!name.empty()) {
         status_message = "Unknown command: " + name + " (try :help)";
     }
@@ -1563,10 +1620,48 @@ bool execute_command(const std::string& line) {
 
 bool process_keypress() {
     const int c = read_key();
+    if (c == MOUSE_CLICK) {
+        if (input_mode != InputMode::Editing &&
+            input_mode != InputMode::TabFocus)
+            return true;
+        const int clicked_row = mouse_row;
+        const int clicked_column = mouse_column - 1;
+        if (clicked_row == screen_rows) {
+            const int index = buffer_at_tab_column(clicked_column);
+            if (index >= 0) {
+                switch_buffer(static_cast<size_t>(index));
+                input_mode = InputMode::TabFocus;
+                shell.focused = false;
+            }
+        } else if (clicked_row >= 1 && clicked_row <= editor_height() &&
+                   sidebar_width() > 0 && clicked_column < sidebar_width()) {
+            const int offset = std::max(0,
+                static_cast<int>(active_buffer) - editor_height() + 1);
+            const int index = offset + clicked_row - 1;
+            if (index >= 0 && index < static_cast<int>(buffers.size())) {
+                switch_buffer(static_cast<size_t>(index));
+                input_mode = InputMode::TabFocus;
+                shell.focused = false;
+            }
+        } else if (shell.master_fd >= 0 &&
+                   clicked_row > editor_height() &&
+                   clicked_row <= screen_rows - 1) {
+            input_mode = InputMode::Editing;
+            shell.focused = true;
+        } else if (clicked_row >= 1 && clicked_row <= editor_height()) {
+            input_mode = InputMode::Editing;
+            shell.focused = false;
+        }
+        return true;
+    }
     if (shell.master_fd >= 0 && shell.focused &&
         input_mode == InputMode::Editing) {
         if (c == F6_KEY) {
             shell.focused = false;
+            status_message.clear();
+        } else if (c == F5_KEY) {
+            shell.focused = false;
+            input_mode = InputMode::TabFocus;
             status_message.clear();
         } else if (c == PAGE_UP) {
             shell.history_offset = std::min(
@@ -1599,6 +1694,17 @@ bool process_keypress() {
             if (!command_line.empty()) command_line.pop_back();
         } else if (isprint(c)) {
             command_line.push_back(static_cast<char>(c));
+        }
+        return true;
+    }
+    if (input_mode == InputMode::TabFocus) {
+        if (c == '\x1b' || c == '\r' || c == '\n' || c == F5_KEY) {
+            input_mode = InputMode::Editing;
+        } else if (c == ARROW_UP && !buffers.empty()) {
+            switch_buffer(active_buffer == 0 ? buffers.size() - 1
+                                             : active_buffer - 1);
+        } else if (c == ARROW_DOWN && !buffers.empty()) {
+            switch_buffer((active_buffer + 1) % buffers.size());
         }
         return true;
     }
@@ -1637,6 +1743,10 @@ bool process_keypress() {
             command_line.clear();
             status_message.clear();
             input_mode = InputMode::Command;
+            break;
+        case F5_KEY:
+            input_mode = InputMode::TabFocus;
+            status_message.clear();
             break;
         case ARROW_UP:
         case ARROW_DOWN:
@@ -1702,6 +1812,8 @@ int main(int argc, char* argv[]) {
         buf.num_rows = 1;
         buffers.push_back(buf);
     }
+    static const char mouse_reporting_on[] = "\x1b[?1000h\x1b[?1006h";
+    write_all(mouse_reporting_on, sizeof(mouse_reporting_on) - 1);
 
     while (true) {
         if (resize_pending) {
@@ -1771,5 +1883,7 @@ int main(int argc, char* argv[]) {
         int child_status;
         while (waitpid(shell.pid, &child_status, 0) == -1 && errno == EINTR) {}
     }
+    static const char mouse_reporting_off[] = "\x1b[?1000l\x1b[?1006l";
+    write_all(mouse_reporting_off, sizeof(mouse_reporting_off) - 1);
     return 0;
 }
